@@ -171,15 +171,27 @@ export default function WebcamCanvas({
     const lastProcessingTimeRef = useRef<number>(0);
 
     // Process video frames
+    const isProcessingRef = useRef(false);
+
     const processFrame = useCallback(async () => {
+        if (isProcessingRef.current) {
+            animationFrameRef.current = requestAnimationFrame(processFrame);
+            return;
+        }
+
         const now = performance.now();
         const delta = now - lastProcessingTimeRef.current;
 
-        // Target 30 FPS (1000/30 = 33.33ms)
-        if (delta >= 30) { // Slight buffer at 30ms to maintain ~30fps accurately
+        // Target 24 FPS (1000/24 = 41.6ms) for better performance
+        if (delta >= 40) {
             if (videoRef.current && poseRef.current && videoRef.current.readyState >= 2) {
                 lastProcessingTimeRef.current = now;
-                await poseRef.current.send({ image: videoRef.current });
+                isProcessingRef.current = true;
+                try {
+                    await poseRef.current.send({ image: videoRef.current });
+                } finally {
+                    isProcessingRef.current = false;
+                }
             }
         }
         animationFrameRef.current = requestAnimationFrame(processFrame);

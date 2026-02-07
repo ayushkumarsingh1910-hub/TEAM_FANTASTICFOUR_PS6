@@ -219,13 +219,17 @@ export function analyzePainExpression(landmarks: Landmark3D[]): number {
     // Normal mouth width is ~0.8-0.9 eye-distances. Pain/Strain stretches it.
     const strainScore = Math.min(100, Math.max(0, (normalizedWidth - 0.9) * 250));
 
-    // 2. Nose-to-Mouth Vertical Tension
+    // 2. Mouth-to-Nose Vertical Tension (Frowning/Drooping)
     const leftDist = calculateDistance3D(nose, mouthLeft);
     const rightDist = calculateDistance3D(nose, mouthRight);
-    const avgMouthDist = (leftDist + rightDist) / 2;
-    const normalizedVertical = avgMouthDist / eyeDist;
-    // Grimacing often pulls mouth corners in ways that deviate from baseline (~1.0)
-    const verticalScore = Math.min(100, Math.max(0, Math.abs(normalizedVertical - 1.0) * 350));
+    // Vertical distance (Y only) to detect drooping mouth corners
+    const leftVertDist = Math.abs(mouthLeft.y - nose.y);
+    const rightVertDist = Math.abs(mouthRight.y - nose.y);
+    const avgVertDist = (leftVertDist + rightVertDist) / 2;
+    const normalizedVertDist = avgVertDist / eyeDist;
+
+    // Normal vertical neutral is ~0.9. Frowning/grimacing stretches the face vertically or pulls corners down.
+    const verticalScore = Math.min(100, Math.max(0, (normalizedVertDist - 1.0) * 400));
 
     // 3. Eye Tension / Squinting
     const leftEyeNose = calculateDistance3D(leftEye, nose);

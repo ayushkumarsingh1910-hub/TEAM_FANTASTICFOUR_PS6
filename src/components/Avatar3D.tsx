@@ -98,9 +98,9 @@ export default function Avatar3D({
         cameraRef.current = camera;
 
         // Renderer
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: 'high-performance' });
         renderer.setSize(width, height);
-        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         containerRef.current.appendChild(renderer.domElement);
         rendererRef.current = renderer;
 
@@ -120,7 +120,7 @@ export default function Avatar3D({
 
         // Create joint spheres
         MAIN_JOINTS.forEach(jointId => {
-            const geometry = new THREE.SphereGeometry(0.05, 16, 16);
+            const geometry = new THREE.SphereGeometry(0.05, 8, 8); // Reduced detail
             const material = new THREE.MeshPhongMaterial({
                 color: STRESS_COLORS.default,
                 emissive: STRESS_COLORS.default,

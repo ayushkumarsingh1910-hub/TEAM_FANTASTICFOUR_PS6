@@ -172,12 +172,13 @@ export class ExerciseEngine {
             case 'pushup':
             case 'tricep-dip':
                 // Elbow angle: starts high (extended), goes low (bent), back to high
+                // Tightened buffers (10 deg instead of 20) to prevent jitter counting
                 if (this.state.phase === 'IDLE' || this.state.phase === 'UP' || this.state.phase === 'COMPLETE') {
-                    if (currentAngle < downAngleThreshold + 20) {
+                    if (currentAngle < downAngleThreshold + 10) {
                         this.state.phase = 'DOWN';
                     }
                 } else if (this.state.phase === 'DOWN') {
-                    if (currentAngle > upAngleThreshold - 20) {
+                    if (currentAngle > upAngleThreshold - 10) {
                         this.state.phase = 'UP';
                         this.countRep();
                     }
