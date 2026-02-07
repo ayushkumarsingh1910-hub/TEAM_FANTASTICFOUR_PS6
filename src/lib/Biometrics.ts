@@ -231,40 +231,40 @@ export function analyzePainClinical(landmarks: Landmark3D[]): PainAnalysis {
     const triggeredAUs: string[] = [];
     let score = 0;
 
-    // AU4: Brow Lowering (Approximated by Eye-to-Nose vertical compression)
+    // AU4: Brow Lowering (Heavily discounted - common in effort/focus)
     const eyeNoseDist = (calculateDistance3D(leftEyeInner, nose) + calculateDistance3D(rightEyeInner, nose)) / 2;
     const normalizedEyeNose = eyeNoseDist / eyeDist;
-    if (normalizedEyeNose < 0.6) {
-        triggeredAUs.push('AU4 (Brow Lowering)');
-        score += 2.5;
+    if (normalizedEyeNose < 0.55) { // More forgiving (was 0.6)
+        triggeredAUs.push('AU4 (Focus/Brows)');
+        score += 1.5; // Reduced weight (was 2.5)
     }
 
-    // AU6/7: Cheek Raising & Lid Tightening (Squinting)
+    // AU6/7: Cheek Raising & Lid Tightening (Discounted - common in exertion)
     const eyeNarrowing = (Math.abs(leftEyeInner.x - leftEyeOuter.x) + Math.abs(rightEyeInner.x - rightEyeOuter.x)) / 2;
     const normalizedNarrowing = eyeNarrowing / eyeDist;
-    if (normalizedNarrowing < 0.25) {
-        triggeredAUs.push('AU6/7 (Lid Tightening)');
-        score += 2.5;
+    if (normalizedNarrowing < 0.22) { // More forgiving (was 0.25)
+        triggeredAUs.push('AU6/7 (Squinting)');
+        score += 1.5; // Reduced weight (was 2.5)
     }
 
-    // AU9: Nose Wrinkling (Mouth-to-Nose compression)
+    // AU9: Nose Wrinkling (Kept high - true sign of pain)
     const mouthNoseDist = (calculateDistance3D(mouthLeft, nose) + calculateDistance3D(mouthRight, nose)) / 2;
     const normalizedMouthNose = mouthNoseDist / eyeDist;
-    if (normalizedMouthNose < 0.85) {
+    if (normalizedMouthNose < 0.8) { // More forgiving (was 0.85)
         triggeredAUs.push('AU9 (Nose Wrinkling)');
-        score += 2;
+        score += 3; // Increased weight relative to others
     }
 
-    // AU10: Upper Lip Raising (Grimacing)
+    // AU10: Upper Lip Raising (Kept high - true sign of pain)
     const mouthWidth = calculateDistance3D(mouthLeft, mouthRight);
     const normalizedMouthWidth = mouthWidth / eyeDist;
-    if (normalizedMouthWidth > 1.05) {
-        triggeredAUs.push('AU10 (Upper Lip Raising)');
-        score += 3;
+    if (normalizedMouthWidth > 1.1) { // More forgiving (was 1.05)
+        triggeredAUs.push('AU10 (Grimace)');
+        score += 4; // High weight
     }
 
     const pain_score_raw = Math.min(10, score);
-    const pain_detected = pain_score_raw > 6;
+    const pain_detected = pain_score_raw > 7.5; // Higher threshold (was 6)
 
     let intensity_level: 'Low' | 'Moderate' | 'High' | 'Critical' = 'Low';
     if (pain_score_raw > 9) intensity_level = 'Critical';
