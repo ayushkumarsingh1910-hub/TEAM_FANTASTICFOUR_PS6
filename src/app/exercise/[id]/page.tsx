@@ -57,6 +57,14 @@ export default function ExercisePage() {
         angularVelocity: 0,
         symmetryScore: 100,
         painScore: 0,
+        painAnalysis: {
+            pain_detected: false,
+            confidence_score: 0,
+            primary_action_units: [],
+            intensity_level: 'Low',
+            recommended_action: 'Continue',
+            pain_score_raw: 0
+        }
     });
     const [elapsedTime, setElapsedTime] = useState(0);
     const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
@@ -89,6 +97,10 @@ export default function ExercisePage() {
     useEffect(() => {
         if (exerciseId) {
             engineRef.current = new ExerciseEngine(exerciseId);
+            engineRef.current.onStopRequest(() => {
+                handleFinish();
+                voiceAssistant.speak("Safety halt: High strain detected. Please stop and rest.");
+            });
         }
         return () => {
             engineRef.current = null;
@@ -281,6 +293,36 @@ export default function ExercisePage() {
                                         >
                                             Start Exercise
                                         </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Clinical Pain Monitor JSON (requested by Specialist) */}
+                            {isActive && (
+                                <div className="absolute top-4 right-4 z-20 w-64 bg-slate-900/90 backdrop-blur border border-slate-700 rounded-lg p-3 font-mono text-[10px] text-cyan-400 overflow-hidden shadow-2xl">
+                                    <div className="flex justify-between items-center mb-1 border-b border-slate-800 pb-1">
+                                        <span className="font-bold text-xs">FACS_ANALYSIS_STREAM</span>
+                                        <span className={`w-2 h-2 rounded-full animate-pulse ${exerciseState.painAnalysis.pain_detected ? 'bg-red-500' : 'bg-green-500'}`}></span>
+                                    </div>
+                                    <pre className="whitespace-pre-wrap">
+                                        {JSON.stringify(exerciseState.painAnalysis, null, 2)}
+                                    </pre>
+                                </div>
+                            )}
+
+                            {/* Clinical Alert Overlay */}
+                            {exerciseState.painAnalysis.recommended_action === 'STOP_EXERCISE' && isActive && (
+                                <div className="absolute inset-0 z-40 bg-red-950/40 backdrop-blur-md flex items-center justify-center p-6 text-center animate-pulse">
+                                    <div className="max-w-md bg-slate-900 border-4 border-red-600 rounded-3xl p-8 shadow-[0_0_50px_rgba(220,38,38,0.5)]">
+                                        <div className="text-6xl mb-4">⚠️</div>
+                                        <h2 className="text-3xl font-bold text-white mb-2 uppercase tracking-tighter">Safety Halt</h2>
+                                        <p className="text-red-400 font-bold mb-4">Acute Pain Patterns Detected (Confidence: {(exerciseState.painAnalysis.confidence_score * 100).toFixed(0)}%)</p>
+                                        <div className="flex flex-wrap gap-2 justify-center mb-6">
+                                            {exerciseState.painAnalysis.primary_action_units.map(au => (
+                                                <span key={au} className="px-2 py-1 bg-red-900/50 text-red-200 border border-red-700 rounded text-[10px]">{au}</span>
+                                            ))}
+                                        </div>
+                                        <p className="text-slate-300 text-sm">Exercise has been automatically paused for your safety.</p>
                                     </div>
                                 </div>
                             )}

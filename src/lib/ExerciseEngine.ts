@@ -32,6 +32,8 @@ export class ExerciseEngine {
     private formCallbacks: ((score: number, stresses: JointStress[]) => void)[] = [];
     private cumulativeHoldDuration: number = 0;
     private lastHoldTick: number = 0;
+    private acutePainStartTime: number | null = null;
+    private stopCallbacks: (() => void)[] = [];
 
     constructor(exerciseId: string) {
         this.exerciseId = exerciseId;
@@ -49,6 +51,14 @@ export class ExerciseEngine {
             symmetryScore: 100,
             isHolding: false,
             painScore: 0,
+            painAnalysis: {
+                pain_detected: false,
+                confidence_score: 0,
+                primary_action_units: [],
+                intensity_level: 'Low',
+                recommended_action: 'Continue',
+                pain_score_raw: 0
+            }
         };
     }
 
@@ -96,8 +106,12 @@ export class ExerciseEngine {
         this.state.jointStress = jointStresses;
         this.state.formScore = calculateFormScore(biometrics, jointStresses);
 
-        // Update pain score
+        // Update pain score and analysis
         this.state.painScore = biometrics.painScore;
+        this.state.painAnalysis = biometrics.painAnalysis;
+
+        // Clinical Temporal Differentiation: Effort vs Acute Pain
+        this.handleClinicalPainThresholds(biometrics.painAnalysis, timestamp);
 
         // Detect phase transitions
         this.detectPhaseTransition(primaryAngle);
@@ -420,12 +434,75 @@ export class ExerciseEngine {
             symmetryScore: 100,
             isHolding: false,
             painScore: 0,
+            painAnalysis: {
+                pain_detected: false,
+                confidence_score: 0,
+                primary_action_units: [],
+                intensity_level: 'Low',
+                recommended_action: 'Continue',
+                pain_score_raw: 0
+            }
         };
         this.previousLandmarks = null;
         this.previousTimestamp = 0;
         this.angleHistory = [];
         this.cumulativeHoldDuration = 0;
         this.lastHoldTick = 0;
+        this.acutePainStartTime = null;
+    }
+
+    /**
+     * Handle clinical pain thresholds with temporal differentiation
+     */
+    private handleClinicalPainThresholds(analysis: any, timestamp: number): void {
+        const painScoreRaw = analysis.pain_score_raw;
+        const isPeak = this.isPeakOfContraction();
+
+        if (painScoreRaw > 7) {
+            // Rule: Distinguish peak-effort grimace from acute pain
+            if (isPeak && analysis.intensity_level !== 'Critical' && this.state.phase === 'UP') {
+                // Rhythmic effort grimace - non-critical
+                this.acutePainStartTime = null;
+            } else {
+                // Acute / Sudden pain detection
+                if (this.acutePainStartTime === null) {
+                    this.acutePainStartTime = timestamp;
+                } else if (timestamp - this.acutePainStartTime > 1500) {
+                    // Safety threshold exceeded: High pain for > 1.5s
+                    this.state.painAnalysis.recommended_action = 'STOP_EXERCISE';
+                    this.stopCallbacks.forEach(cb => cb());
+                }
+            }
+        } else {
+            this.acutePainStartTime = null;
+        }
+    }
+
+    /**
+     * Determines if user is at the peak point of exertion/contraction
+     */
+    private isPeakOfContraction(): boolean {
+        if (!this.exercise) return false;
+        const { currentAngle } = this.state;
+        const { downAngleThreshold, upAngleThreshold } = this.exercise;
+
+        switch (this.exerciseId) {
+            case 'bicep-curl':
+                return currentAngle < upAngleThreshold + 15; // Peak contraction at top
+            case 'squat':
+                return currentAngle < downAngleThreshold + 15; // Peak effort at bottom
+            case 'pushup':
+                return currentAngle < downAngleThreshold + 15;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Subscribe to stop triggers (injury prevention)
+     */
+    onStopRequest(callback: () => void): void {
+        this.stopCallbacks.push(callback);
     }
 
     /**

@@ -1,5 +1,5 @@
 // Biomechanical calculations for joint angles, angular velocity, and symmetry
-import { Landmark3D, PoseLandmark, BiometricData, JointStress } from '@/types';
+import { Landmark3D, PoseLandmark, BiometricData, JointStress, PainAnalysis } from '@/types';
 
 // 3D Vector operations
 interface Vector3D {
@@ -199,49 +199,98 @@ export function getSpineAngle(landmarks: Landmark3D[]): number {
     return calculateAngle3D(nose, shoulderMid, hipMid);
 }
 
-export function analyzePainExpression(landmarks: Landmark3D[]): number {
+/**
+ * Clinical Pain Face Detection (FACS-based)
+ * Monitors AU4 (Brows), AU6/7 (Eyes), AU9 (Nose), AU10 (Lip)
+ */
+export function analyzePainClinical(landmarks: Landmark3D[]): PainAnalysis {
     const nose = landmarks[PoseLandmark.NOSE];
     const mouthLeft = landmarks[PoseLandmark.MOUTH_LEFT];
     const mouthRight = landmarks[PoseLandmark.MOUTH_RIGHT];
     const leftEye = landmarks[PoseLandmark.LEFT_EYE];
     const rightEye = landmarks[PoseLandmark.RIGHT_EYE];
+    const leftEyeInner = landmarks[PoseLandmark.LEFT_EYE_INNER];
+    const rightEyeInner = landmarks[PoseLandmark.RIGHT_EYE_INNER];
+    const leftEyeOuter = landmarks[PoseLandmark.LEFT_EYE_OUTER];
+    const rightEyeOuter = landmarks[PoseLandmark.RIGHT_EYE_OUTER];
 
-    if (!nose || !mouthLeft || !mouthRight || !leftEye || !rightEye) return 0;
+    if (!nose || !mouthLeft || !mouthRight || !leftEye || !rightEye) {
+        return {
+            pain_detected: false,
+            confidence_score: 0,
+            primary_action_units: [],
+            intensity_level: 'Low',
+            recommended_action: 'Continue',
+            pain_score_raw: 0
+        };
+    }
 
-    // Normalize distances using inter-ocular distance (eye-to-eye) 
-    // This makes the detector robust to the user's distance from the camera
     const eyeDist = calculateDistance3D(leftEye, rightEye);
-    if (eyeDist === 0) return 0;
+    if (eyeDist === 0) return { pain_detected: false, confidence_score: 0, primary_action_units: [], intensity_level: 'Low', recommended_action: 'Continue', pain_score_raw: 0 };
 
-    // 1. Mouth Lateral Tension (Grimacing)
+    const triggeredAUs: string[] = [];
+    let score = 0;
+
+    // AU4: Brow Lowering (Approximated by Eye-to-Nose vertical compression)
+    const eyeNoseDist = (calculateDistance3D(leftEyeInner, nose) + calculateDistance3D(rightEyeInner, nose)) / 2;
+    const normalizedEyeNose = eyeNoseDist / eyeDist;
+    if (normalizedEyeNose < 0.6) {
+        triggeredAUs.push('AU4 (Brow Lowering)');
+        score += 2.5;
+    }
+
+    // AU6/7: Cheek Raising & Lid Tightening (Squinting)
+    const eyeNarrowing = (Math.abs(leftEyeInner.x - leftEyeOuter.x) + Math.abs(rightEyeInner.x - rightEyeOuter.x)) / 2;
+    const normalizedNarrowing = eyeNarrowing / eyeDist;
+    if (normalizedNarrowing < 0.25) {
+        triggeredAUs.push('AU6/7 (Lid Tightening)');
+        score += 2.5;
+    }
+
+    // AU9: Nose Wrinkling (Mouth-to-Nose compression)
+    const mouthNoseDist = (calculateDistance3D(mouthLeft, nose) + calculateDistance3D(mouthRight, nose)) / 2;
+    const normalizedMouthNose = mouthNoseDist / eyeDist;
+    if (normalizedMouthNose < 0.85) {
+        triggeredAUs.push('AU9 (Nose Wrinkling)');
+        score += 2;
+    }
+
+    // AU10: Upper Lip Raising (Grimacing)
     const mouthWidth = calculateDistance3D(mouthLeft, mouthRight);
-    const normalizedWidth = mouthWidth / eyeDist;
-    // Normal mouth width is ~0.8-0.9 eye-distances. Pain/Strain stretches it.
-    const strainScore = Math.min(100, Math.max(0, (normalizedWidth - 0.9) * 250));
+    const normalizedMouthWidth = mouthWidth / eyeDist;
+    if (normalizedMouthWidth > 1.05) {
+        triggeredAUs.push('AU10 (Upper Lip Raising)');
+        score += 3;
+    }
 
-    // 2. Mouth-to-Nose Vertical Tension (Frowning/Drooping)
-    const leftDist = calculateDistance3D(nose, mouthLeft);
-    const rightDist = calculateDistance3D(nose, mouthRight);
-    // Vertical distance (Y only) to detect drooping mouth corners
-    const leftVertDist = Math.abs(mouthLeft.y - nose.y);
-    const rightVertDist = Math.abs(mouthRight.y - nose.y);
-    const avgVertDist = (leftVertDist + rightVertDist) / 2;
-    const normalizedVertDist = avgVertDist / eyeDist;
+    const pain_score_raw = Math.min(10, score);
+    const pain_detected = pain_score_raw > 6;
 
-    // Normal vertical neutral is ~0.9. Frowning/grimacing stretches the face vertically or pulls corners down.
-    const verticalScore = Math.min(100, Math.max(0, (normalizedVertDist - 1.0) * 400));
+    let intensity_level: 'Low' | 'Moderate' | 'High' | 'Critical' = 'Low';
+    if (pain_score_raw > 9) intensity_level = 'Critical';
+    else if (pain_score_raw > 7) intensity_level = 'High';
+    else if (pain_score_raw > 4) intensity_level = 'Moderate';
 
-    // 3. Eye Tension / Squinting
-    const leftEyeNose = calculateDistance3D(leftEye, nose);
-    const rightEyeNose = calculateDistance3D(rightEye, nose);
-    const avgEyeNose = (leftEyeNose + rightEyeNose) / 2;
-    const normalizedEyeNose = avgEyeNose / eyeDist;
-    // Eyes move closer to the nose centerline (lower distance) when squinting/furrowing
-    const eyeTensionScore = Math.min(100, Math.max(0, (0.7 - normalizedEyeNose) * 600));
+    let recommended_action: 'Continue' | 'Warning: Reduce Weight' | 'STOP_EXERCISE' = 'Continue';
+    if (intensity_level === 'Critical' || intensity_level === 'High') {
+        recommended_action = 'STOP_EXERCISE';
+    } else if (intensity_level === 'Moderate') {
+        recommended_action = 'Warning: Reduce Weight';
+    }
 
-    // Aggregate with priority on mouth stretch and vertical frowning
-    const compositeScore = (strainScore * 0.4) + (verticalScore * 0.4) + (eyeTensionScore * 0.2);
-    return Math.round(Math.min(100, compositeScore));
+    return {
+        pain_detected,
+        confidence_score: 0.85, // Constant for basic pose estimation
+        primary_action_units: triggeredAUs,
+        intensity_level,
+        recommended_action,
+        pain_score_raw
+    };
+}
+
+export function analyzePainExpression(landmarks: Landmark3D[]): number {
+    const analysis = analyzePainClinical(landmarks);
+    return analysis.pain_score_raw * 10; // Map 0-10 to 0-100 for compatibility
 }
 
 /**
@@ -299,7 +348,8 @@ export function calculateBiometrics(
             symmetryScores.knee + symmetryScores.hip) / 4
     );
 
-    const painScore = analyzePainExpression(landmarks);
+    const painAnalysis = analyzePainClinical(landmarks);
+    const painScore = painAnalysis.pain_score_raw * 10;
 
     return {
         jointAngles,
@@ -307,6 +357,7 @@ export function calculateBiometrics(
         symmetryScores,
         overallSymmetry,
         painScore,
+        painAnalysis,
     };
 }
 

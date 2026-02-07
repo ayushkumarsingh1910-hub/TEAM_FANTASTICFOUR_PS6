@@ -101,7 +101,8 @@ export interface ExerciseState {
   symmetryScore: number;
   holdStartTime?: number;
   isHolding?: boolean;
-  painScore: number; // 0-100 (0 = comfortable, 100 = high pain expression)
+  painScore: number; // 0-100 (backwards compatibility)
+  painAnalysis: PainAnalysis;
 }
 
 // Session data for persistence
@@ -155,13 +156,24 @@ export interface DTWResult {
   qualityScore: number; // 0-100
 }
 
+// Clinical Pain Analysis (FACS-based)
+export interface PainAnalysis {
+  pain_detected: boolean;
+  confidence_score: number;
+  primary_action_units: string[];
+  intensity_level: 'Low' | 'Moderate' | 'High' | 'Critical';
+  recommended_action: 'Continue' | 'Warning: Reduce Weight' | 'STOP_EXERCISE';
+  pain_score_raw: number; // 0-10 scale
+}
+
 // Biometric calculations
 export interface BiometricData {
   jointAngles: { [key: string]: number };
   angularVelocities: { [key: string]: number };
   symmetryScores: { [key: string]: number };
   overallSymmetry: number;
-  painScore: number; // 0-100
+  painScore: number; // 0-100 (backwards compatibility)
+  painAnalysis: PainAnalysis;
 }
 
 // Weekly/Monthly report data
