@@ -297,16 +297,63 @@ export default function ExercisePage() {
                                 </div>
                             )}
 
-                            {/* Clinical Pain Monitor JSON (requested by Specialist) */}
+                            {/* Clinical Pain Monitor HUD */}
                             {isActive && (
-                                <div className="absolute top-4 right-4 z-20 w-64 bg-slate-900/90 backdrop-blur border border-slate-700 rounded-lg p-3 font-mono text-[10px] text-cyan-400 overflow-hidden shadow-2xl">
-                                    <div className="flex justify-between items-center mb-1 border-b border-slate-800 pb-1">
-                                        <span className="font-bold text-xs">FACS_ANALYSIS_STREAM</span>
-                                        <span className={`w-2 h-2 rounded-full animate-pulse ${exerciseState.painAnalysis.pain_detected ? 'bg-red-500' : 'bg-green-500'}`}></span>
+                                <div className="absolute top-4 right-4 z-20 w-72 bg-slate-950/60 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-4 shadow-2xl overflow-hidden group hover:bg-slate-950/80 transition-all duration-500">
+                                    {/* Medical Scanning Effect */}
+                                    <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-20">
+                                        <div className="w-full h-1 bg-cyan-400 absolute animate-scan"></div>
                                     </div>
-                                    <pre className="whitespace-pre-wrap">
-                                        {JSON.stringify(exerciseState.painAnalysis, null, 2)}
-                                    </pre>
+
+                                    <div className="relative z-10">
+                                        <div className="flex justify-between items-center mb-4 border-b border-slate-800 pb-2">
+                                            <div className="flex items-center gap-2">
+                                                <div className={`w-2 h-2 rounded-full ${exerciseState.painAnalysis.pain_detected ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]' : 'bg-green-500'} animate-pulse`}></div>
+                                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Biometric Analysis</span>
+                                            </div>
+                                            <span className="text-[10px] text-cyan-500 font-mono">LIVE_FEED</span>
+                                        </div>
+
+                                        <div className="space-y-4">
+                                            {/* Primary Intensity Meter */}
+                                            <div>
+                                                <div className="flex justify-between items-end mb-1">
+                                                    <span className="text-xs font-semibold text-white">Intensity Level</span>
+                                                    <span className={`text-sm font-bold ${exerciseState.painAnalysis.pain_detected ? 'text-red-400' : 'text-cyan-400'}`}>
+                                                        {exerciseState.painAnalysis.intensity_level}
+                                                    </span>
+                                                </div>
+                                                <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                                                    <div
+                                                        className={`h-full transition-all duration-300 rounded-full ${exerciseState.painAnalysis.pain_score_raw > 7 ? 'bg-red-500' :
+                                                                exerciseState.painAnalysis.pain_score_raw > 4 ? 'bg-orange-500' : 'bg-cyan-500'
+                                                            }`}
+                                                        style={{ width: `${exerciseState.painAnalysis.pain_score_raw * 10}%` }}
+                                                    ></div>
+                                                </div>
+                                            </div>
+
+                                            {/* Action Units Grid */}
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div className="col-span-2 text-[9px] text-slate-500 uppercase font-bold mb-1 tracking-tighter">Detected Indicators (FACS)</div>
+                                                {['AU4', 'AU6/7', 'AU9', 'AU10'].map(au => {
+                                                    const isTracked = exerciseState.painAnalysis.primary_action_units.some(u => u.includes(au));
+                                                    return (
+                                                        <div key={au} className={`flex items-center justify-between px-2 py-1.5 rounded-lg border border-slate-800/50 transition-colors ${isTracked ? 'bg-red-500/10 border-red-500/30' : 'bg-slate-900/50'}`}>
+                                                            <span className={`text-[9px] font-mono ${isTracked ? 'text-red-400' : 'text-slate-500'}`}>{au}</span>
+                                                            <div className={`w-1 h-1 rounded-full ${isTracked ? 'bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.5)]' : 'bg-slate-700'}`}></div>
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
+
+                                            {/* AI Confidence */}
+                                            <div className="flex items-center justify-between text-[10px] text-slate-600 border-t border-slate-800 pt-2 font-mono">
+                                                <span>AI_CONFIDENCE</span>
+                                                <span>{(exerciseState.painAnalysis.confidence_score * 100).toFixed(1)}%</span>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             )}
 
