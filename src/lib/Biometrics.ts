@@ -239,8 +239,8 @@ export function analyzePainExpression(landmarks: Landmark3D[]): number {
     // Eyes move closer to the nose centerline (lower distance) when squinting/furrowing
     const eyeTensionScore = Math.min(100, Math.max(0, (0.7 - normalizedEyeNose) * 600));
 
-    // Aggregate with weighted priority on mouth stretch (most visible in pose)
-    const compositeScore = (strainScore * 0.5) + (verticalScore * 0.2) + (eyeTensionScore * 0.3);
+    // Aggregate with priority on mouth stretch and vertical frowning
+    const compositeScore = (strainScore * 0.4) + (verticalScore * 0.4) + (eyeTensionScore * 0.2);
     return Math.round(Math.min(100, compositeScore));
 }
 
