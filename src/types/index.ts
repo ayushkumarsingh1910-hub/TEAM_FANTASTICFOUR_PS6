@@ -103,6 +103,9 @@ export interface ExerciseState {
   isHolding?: boolean;
   painScore: number; // 0-100 (backwards compatibility)
   painAnalysis: PainAnalysis;
+  safetyLog: SafetyLog;
+  isCalibrating: boolean;
+  calibrationProgress: number; // 0-100
 }
 
 // Session data for persistence
@@ -166,6 +169,14 @@ export interface PainAnalysis {
   pain_score_raw: number; // 0-10 scale
 }
 
+// Beginner-friendly Safety Log (RCAFT)
+export interface SafetyLog {
+  status: 'Scanning' | 'Effort Detected' | 'PAIN ALERT' | 'Calibrating';
+  pain_level: number; // 1-100
+  ui_message: string;
+  system_command: null | 'HALT_WORKOUT';
+}
+
 // Biometric calculations
 export interface BiometricData {
   jointAngles: { [key: string]: number };
@@ -174,6 +185,7 @@ export interface BiometricData {
   overallSymmetry: number;
   painScore: number; // 0-100 (backwards compatibility)
   painAnalysis: PainAnalysis;
+  safetyLog: SafetyLog;
 }
 
 // Weekly/Monthly report data

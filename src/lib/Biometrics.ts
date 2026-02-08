@@ -1,5 +1,13 @@
 // Biomechanical calculations for joint angles, angular velocity, and symmetry
-import { Landmark3D, PoseLandmark, BiometricData, JointStress, PainAnalysis } from '@/types';
+import { Landmark3D, PoseLandmark, BiometricData, JointStress, PainAnalysis, SafetyLog } from '@/types';
+
+export interface CalibrationBaseline {
+    eyeDist: number;
+    eyeNoseRatio: number;
+    eyeNarrowRatio: number;
+    mouthNoseRatio: number;
+    mouthWidthRatio: number;
+}
 
 // 3D Vector operations
 interface Vector3D {
@@ -99,6 +107,27 @@ export function getElbowAngle(
         : landmarks[PoseLandmark.RIGHT_WRIST];
 
     return calculateAngle3D(shoulder, elbow, wrist);
+}
+
+/**
+ * Get weighted elbow angle based on visibility to prevent flickering
+ */
+export function getRobustElbowAngle(landmarks: Landmark3D[]): number {
+    const leftAngle = getElbowAngle(landmarks, 'left');
+    const rightAngle = getElbowAngle(landmarks, 'right');
+
+    const leftVis = (landmarks[PoseLandmark.LEFT_SHOULDER].visibility || 0) *
+        (landmarks[PoseLandmark.LEFT_ELBOW].visibility || 0) *
+        (landmarks[PoseLandmark.LEFT_WRIST].visibility || 0);
+    const rightVis = (landmarks[PoseLandmark.RIGHT_SHOULDER].visibility || 0) *
+        (landmarks[PoseLandmark.RIGHT_ELBOW].visibility || 0) *
+        (landmarks[PoseLandmark.RIGHT_WRIST].visibility || 0);
+
+    if (leftVis < 0.3 && rightVis < 0.3) return -1;
+
+    // Preference for better visibility
+    if (leftVis > 0.7 && rightVis > 0.7) return (leftAngle + rightAngle) / 2;
+    return leftVis > rightVis ? leftAngle : rightAngle;
 }
 
 export function getShoulderAngle(
@@ -203,7 +232,7 @@ export function getSpineAngle(landmarks: Landmark3D[]): number {
  * Clinical Pain Face Detection (FACS-based)
  * Monitors AU4 (Brows), AU6/7 (Eyes), AU9 (Nose), AU10 (Lip)
  */
-export function analyzePainClinical(landmarks: Landmark3D[]): PainAnalysis {
+export function analyzePainClinical(landmarks: Landmark3D[], baseline?: CalibrationBaseline): PainAnalysis {
     const nose = landmarks[PoseLandmark.NOSE];
     const mouthLeft = landmarks[PoseLandmark.MOUTH_LEFT];
     const mouthRight = landmarks[PoseLandmark.MOUTH_RIGHT];
@@ -231,40 +260,48 @@ export function analyzePainClinical(landmarks: Landmark3D[]): PainAnalysis {
     const triggeredAUs: string[] = [];
     let score = 0;
 
-    // AU4: Brow Lowering (Heavily discounted - common in effort/focus)
+    // AU4: Brow Lowering - MORE RELAXED
     const eyeNoseDist = (calculateDistance3D(leftEyeInner, nose) + calculateDistance3D(rightEyeInner, nose)) / 2;
     const normalizedEyeNose = eyeNoseDist / eyeDist;
-    if (normalizedEyeNose < 0.55) { // More forgiving (was 0.6)
+    const au4Threshold = baseline ? baseline.eyeNoseRatio * 0.90 : 0.52; // Relaxed from 0.94 / 0.58
+    if (normalizedEyeNose < au4Threshold) {
         triggeredAUs.push('AU4 (Focus/Brows)');
-        score += 1.5; // Reduced weight (was 2.5)
+        const intensity = Math.min(1.5, (au4Threshold - normalizedEyeNose) / (au4Threshold * 0.08)); // Reduced factor
+        score += 1.2 * intensity; // Reduced weight from 1.5
     }
 
-    // AU6/7: Cheek Raising & Lid Tightening (Discounted - common in exertion)
+    // AU6/7: Cheek Raising & Lid Tightening - MORE RELAXED
     const eyeNarrowing = (Math.abs(leftEyeInner.x - leftEyeOuter.x) + Math.abs(rightEyeInner.x - rightEyeOuter.x)) / 2;
     const normalizedNarrowing = eyeNarrowing / eyeDist;
-    if (normalizedNarrowing < 0.22) { // More forgiving (was 0.25)
+    const au6Threshold = baseline ? baseline.eyeNarrowRatio * 0.88 : 0.20; // Relaxed from 0.92 / 0.24
+    if (normalizedNarrowing < au6Threshold) {
         triggeredAUs.push('AU6/7 (Squinting)');
-        score += 1.5; // Reduced weight (was 2.5)
+        const intensity = Math.min(1.5, (au6Threshold - normalizedNarrowing) / (au6Threshold * 0.08));
+        score += 1.2 * intensity; // Reduced weight from 1.5
     }
 
-    // AU9: Nose Wrinkling (Kept high - true sign of pain)
+    // AU9: Nose Wrinkling - MORE RELAXED
     const mouthNoseDist = (calculateDistance3D(mouthLeft, nose) + calculateDistance3D(mouthRight, nose)) / 2;
     const normalizedMouthNose = mouthNoseDist / eyeDist;
-    if (normalizedMouthNose < 0.8) { // More forgiving (was 0.85)
+    const au9Threshold = baseline ? baseline.mouthNoseRatio * 0.93 : 0.78; // Relaxed from 0.96 / 0.82
+    if (normalizedMouthNose < au9Threshold) {
         triggeredAUs.push('AU9 (Nose Wrinkling)');
-        score += 3; // Increased weight relative to others
+        const intensity = Math.min(1.5, (au9Threshold - normalizedMouthNose) / (au9Threshold * 0.08));
+        score += 2.5 * intensity; // Reduced weight from 3
     }
 
-    // AU10: Upper Lip Raising (Kept high - true sign of pain)
+    // AU10: Upper Lip Raising - MORE RELAXED
     const mouthWidth = calculateDistance3D(mouthLeft, mouthRight);
     const normalizedMouthWidth = mouthWidth / eyeDist;
-    if (normalizedMouthWidth > 1.1) { // More forgiving (was 1.05)
+    const au10Threshold = baseline ? baseline.mouthWidthRatio * 1.15 : 1.12; // Relaxed from 1.12 / 1.08
+    if (normalizedMouthWidth > au10Threshold) {
         triggeredAUs.push('AU10 (Grimace)');
-        score += 4; // High weight
+        const intensity = Math.min(1.5, (normalizedMouthWidth - au10Threshold) / (au10Threshold * 0.08));
+        score += 3 * intensity; // Reduced weight from 4
     }
 
     const pain_score_raw = Math.min(10, score);
-    const pain_detected = pain_score_raw > 7.5; // Higher threshold (was 6)
+    const pain_detected = pain_score_raw > 7.5;
 
     let intensity_level: 'Low' | 'Moderate' | 'High' | 'Critical' = 'Low';
     if (pain_score_raw > 9) intensity_level = 'Critical';
@@ -288,8 +325,8 @@ export function analyzePainClinical(landmarks: Landmark3D[]): PainAnalysis {
     };
 }
 
-export function analyzePainExpression(landmarks: Landmark3D[]): number {
-    const analysis = analyzePainClinical(landmarks);
+export function analyzePainExpression(landmarks: Landmark3D[], baseline?: CalibrationBaseline): number {
+    const analysis = analyzePainClinical(landmarks, baseline);
     return analysis.pain_score_raw * 10; // Map 0-10 to 0-100 for compatibility
 }
 
@@ -299,7 +336,8 @@ export function analyzePainExpression(landmarks: Landmark3D[]): number {
 export function calculateBiometrics(
     landmarks: Landmark3D[],
     previousLandmarks?: Landmark3D[],
-    deltaTimeMs?: number
+    deltaTimeMs?: number,
+    baseline?: CalibrationBaseline
 ): BiometricData {
     const jointAngles: { [key: string]: number } = {
         leftElbow: getElbowAngle(landmarks, 'left'),
@@ -348,8 +386,16 @@ export function calculateBiometrics(
             symmetryScores.knee + symmetryScores.hip) / 4
     );
 
-    const painAnalysis = analyzePainClinical(landmarks);
+    const painAnalysis = analyzePainClinical(landmarks, baseline);
     const painScore = painAnalysis.pain_score_raw * 10;
+
+    // Default safety log (will be refined by ExerciseEngine with temporal logic)
+    const safetyLog: SafetyLog = {
+        status: 'Scanning',
+        pain_level: Math.round(painScore),
+        ui_message: painScore > 70 ? "PAIN DETECTED: Stop!" : painScore > 40 ? "Take a breath" : "Scanning...",
+        system_command: null
+    };
 
     return {
         jointAngles,
@@ -358,6 +404,7 @@ export function calculateBiometrics(
         overallSymmetry,
         painScore,
         painAnalysis,
+        safetyLog,
     };
 }
 

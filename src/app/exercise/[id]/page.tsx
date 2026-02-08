@@ -56,6 +56,7 @@ export default function ExercisePage() {
         startTime: Date.now(),
         angularVelocity: 0,
         symmetryScore: 100,
+        isHolding: false,
         painScore: 0,
         painAnalysis: {
             pain_detected: false,
@@ -64,7 +65,15 @@ export default function ExercisePage() {
             intensity_level: 'Low',
             recommended_action: 'Continue',
             pain_score_raw: 0
-        }
+        },
+        safetyLog: {
+            status: 'Scanning',
+            pain_level: 0,
+            ui_message: 'Starting calibration...',
+            system_command: null
+        },
+        isCalibrating: true,
+        calibrationProgress: 0
     });
     const [elapsedTime, setElapsedTime] = useState(0);
     const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
@@ -82,10 +91,15 @@ export default function ExercisePage() {
     }, [exerciseState.repCount, isActive]);
 
     useEffect(() => {
-        if (isActive && !isPaused && exerciseState.painScore > 60) {
-            voiceAssistant.warnPain(exerciseState.painScore);
+        // RCAFT: Safety Voice Alerts
+        if (isActive && !isPaused) {
+            if (exerciseState.safetyLog.status === 'PAIN ALERT') {
+                voiceAssistant.speak("Pain detected. Caution.");
+            } else if (exerciseState.safetyLog.system_command === 'HALT_WORKOUT') {
+                voiceAssistant.speak("Safety halt: High strain detected. Please stop and rest.");
+            }
         }
-    }, [exerciseState.painScore, isActive, isPaused]);
+    }, [exerciseState.safetyLog.status, exerciseState.safetyLog.system_command, isActive, isPaused]);
 
     useEffect(() => {
         if (isActive && !isPaused) {
@@ -98,8 +112,8 @@ export default function ExercisePage() {
         if (exerciseId) {
             engineRef.current = new ExerciseEngine(exerciseId);
             engineRef.current.onStopRequest(() => {
-                handleFinish();
-                voiceAssistant.speak("Safety halt: High strain detected. Please stop and rest.");
+                // handleFinish is called but we want to stay in the Safety Halt state if it was triggered
+                // The engine handles the callback trigger.
             });
         }
         return () => {
@@ -110,13 +124,13 @@ export default function ExercisePage() {
     // Timer
     useEffect(() => {
         let interval: NodeJS.Timeout;
-        if (isActive && !isPaused) {
+        if (isActive && !isPaused && !exerciseState.isCalibrating) {
             interval = setInterval(() => {
                 setElapsedTime((Date.now() - startTimeRef.current) / 1000);
             }, 100);
         }
         return () => clearInterval(interval);
-    }, [isActive, isPaused]);
+    }, [isActive, isPaused, exerciseState.isCalibrating]);
 
     // Handle pose detection
     const handlePoseDetected = useCallback((pose: PoseData | null) => {
@@ -127,11 +141,14 @@ export default function ExercisePage() {
 
         setCurrentLandmarks(pose.landmarks);
 
+        // Don't process if we've halted
+        if (exerciseState.safetyLog.system_command === 'HALT_WORKOUT') return;
+
         if (isActive) {
             const state = engineRef.current.processFrame(pose.landmarks, pose.timestamp);
             setExerciseState(state);
         }
-    }, [isActive, isPaused]);
+    }, [isActive, isPaused, exerciseState.safetyLog.system_command]);
 
     // Start exercise
     const handleStart = () => {
@@ -297,79 +314,130 @@ export default function ExercisePage() {
                                 </div>
                             )}
 
-                            {/* Clinical Pain Monitor HUD */}
-                            {isActive && (
-                                <div className="absolute top-4 right-4 z-20 w-72 bg-slate-950/60 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-4 shadow-2xl overflow-hidden group hover:bg-slate-950/80 transition-all duration-500">
-                                    {/* Medical Scanning Effect */}
-                                    <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-20">
-                                        <div className="w-full h-1 bg-cyan-400 absolute animate-scan"></div>
-                                    </div>
-
-                                    <div className="relative z-10">
-                                        <div className="flex justify-between items-center mb-4 border-b border-slate-800 pb-2">
-                                            <div className="flex items-center gap-2">
-                                                <div className={`w-2 h-2 rounded-full ${exerciseState.painAnalysis.pain_detected ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]' : 'bg-green-500'} animate-pulse`}></div>
-                                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Biometric Analysis</span>
+                            {/* Calibration Overlay */}
+                            {isActive && exerciseState.isCalibrating && (
+                                <div className="absolute inset-0 z-30 bg-slate-900/60 backdrop-blur-md flex items-center justify-center rounded-2xl border-4 border-cyan-500/20">
+                                    <div className="text-center p-8 max-w-sm">
+                                        <div className="relative w-24 h-24 mx-auto mb-6">
+                                            <svg className="w-full h-full transform -rotate-90">
+                                                <circle
+                                                    cx="48"
+                                                    cy="48"
+                                                    r="40"
+                                                    stroke="currentColor"
+                                                    strokeWidth="8"
+                                                    fill="transparent"
+                                                    className="text-slate-800"
+                                                />
+                                                <circle
+                                                    cx="48"
+                                                    cy="48"
+                                                    r="40"
+                                                    stroke="currentColor"
+                                                    strokeWidth="8"
+                                                    fill="transparent"
+                                                    strokeDasharray={251.2}
+                                                    strokeDashoffset={251.2 * (1 - exerciseState.calibrationProgress / 100)}
+                                                    className="text-cyan-500 transition-all duration-300"
+                                                />
+                                            </svg>
+                                            <div className="absolute inset-0 flex items-center justify-center font-bold text-white text-lg">
+                                                {Math.round(exerciseState.calibrationProgress)}%
                                             </div>
-                                            <span className="text-[10px] text-cyan-500 font-mono">LIVE_FEED</span>
+                                        </div>
+                                        <h2 className="text-xl font-bold text-white mb-2 uppercase tracking-widest">Calibrating</h2>
+                                        <p className="text-slate-400 text-sm mb-4">Establishing your facial baseline. Please look directly at the camera with a neutral expression.</p>
+                                        <div className="flex justify-center gap-1">
+                                            <div className="w-1.5 h-1.5 bg-cyan-500 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                                            <div className="w-1.5 h-1.5 bg-cyan-500 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                                            <div className="w-1.5 h-1.5 bg-cyan-500 rounded-full animate-bounce"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* RCAFT "Virtual Spotter" Log HUD */}
+                            {isActive && !exerciseState.isCalibrating && (
+                                <div className="absolute top-4 right-4 z-20 w-80 bg-slate-950/80 backdrop-blur-2xl border-2 border-slate-700/50 rounded-2xl p-5 shadow-2xl font-mono group hover:border-cyan-500/30 transition-all duration-500">
+                                    {/* Medical Scanning Grid Effect */}
+                                    <div className="absolute inset-0 opacity-10 pointer-events-none bg-[linear-gradient(rgba(18,24,38,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(18,24,38,0.1)_1px,transparent_1px)] bg-[size:20px_20px]"></div>
+
+                                    <div className="relative z-10 space-y-4">
+                                        <div className="flex justify-between items-center border-b border-slate-800 pb-2">
+                                            <div className="flex items-center gap-2">
+                                                <div className={`w-2.5 h-2.5 rounded-sm ${exerciseState.safetyLog.status === 'PAIN ALERT' ? 'bg-red-500 animate-pulse' :
+                                                    exerciseState.safetyLog.status === 'Effort Detected' ? 'bg-orange-500' : 'bg-green-500'
+                                                    }`}></div>
+                                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">RCAFT Safety Engine</span>
+                                            </div>
+                                            <span className="text-[9px] text-cyan-500 animate-pulse font-bold">V_SPOTTER_1.0</span>
                                         </div>
 
-                                        <div className="space-y-4">
-                                            {/* Primary Intensity Meter */}
-                                            <div>
-                                                <div className="flex justify-between items-end mb-1">
-                                                    <span className="text-xs font-semibold text-white">Intensity Level</span>
-                                                    <span className={`text-sm font-bold ${exerciseState.painAnalysis.pain_detected ? 'text-red-400' : 'text-cyan-400'}`}>
-                                                        {exerciseState.painAnalysis.intensity_level}
+                                        <div className="space-y-3">
+                                            {/* Status Log */}
+                                            <div className="flex justify-between items-center text-xs">
+                                                <span className="text-slate-500 uppercase">Status:</span>
+                                                <span className={`font-bold px-2 py-0.5 rounded ${exerciseState.safetyLog.status === 'PAIN ALERT' ? 'bg-red-500/20 text-red-500 border border-red-500/30' :
+                                                    exerciseState.safetyLog.status === 'Effort Detected' ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
+                                                        'bg-green-500/20 text-green-400 border border-green-500/30'
+                                                    }`}>
+                                                    {exerciseState.safetyLog.status}
+                                                </span>
+                                            </div>
+
+                                            {/* Pain Level Bar */}
+                                            <div className="space-y-1">
+                                                <div className="flex justify-between text-[10px]">
+                                                    <span className="text-slate-500 uppercase">Pain Level:</span>
+                                                    <span className={`font-bold ${exerciseState.safetyLog.pain_level > 70 ? 'text-red-400' : 'text-cyan-400'}`}>
+                                                        {exerciseState.safetyLog.pain_level}/100
                                                     </span>
                                                 </div>
-                                                <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
-                                                    <div
-                                                        className={`h-full transition-all duration-300 rounded-full ${exerciseState.painAnalysis.pain_score_raw > 7 ? 'bg-red-500' :
-                                                                exerciseState.painAnalysis.pain_score_raw > 4 ? 'bg-orange-500' : 'bg-cyan-500'
-                                                            }`}
-                                                        style={{ width: `${exerciseState.painAnalysis.pain_score_raw * 10}%` }}
-                                                    ></div>
+                                                <div className="h-1.5 w-full bg-slate-900 rounded-sm overflow-hidden flex gap-0.5">
+                                                    {[...Array(20)].map((_, i) => (
+                                                        <div
+                                                            key={i}
+                                                            className={`flex-1 h-full rounded-sm transition-all duration-500 ${i < (exerciseState.safetyLog.pain_level / 5)
+                                                                ? (i > 14 ? 'bg-red-500' : i > 8 ? 'bg-orange-500' : 'bg-cyan-500')
+                                                                : 'bg-slate-800'
+                                                                }`}></div>
+                                                    ))}
                                                 </div>
                                             </div>
 
-                                            {/* Action Units Grid */}
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div className="col-span-2 text-[9px] text-slate-500 uppercase font-bold mb-1 tracking-tighter">Detected Indicators (FACS)</div>
-                                                {['AU4', 'AU6/7', 'AU9', 'AU10'].map(au => {
-                                                    const isTracked = exerciseState.painAnalysis.primary_action_units.some(u => u.includes(au));
-                                                    return (
-                                                        <div key={au} className={`flex items-center justify-between px-2 py-1.5 rounded-lg border border-slate-800/50 transition-colors ${isTracked ? 'bg-red-500/10 border-red-500/30' : 'bg-slate-900/50'}`}>
-                                                            <span className={`text-[9px] font-mono ${isTracked ? 'text-red-400' : 'text-slate-500'}`}>{au}</span>
-                                                            <div className={`w-1 h-1 rounded-full ${isTracked ? 'bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.5)]' : 'bg-slate-700'}`}></div>
-                                                        </div>
-                                                    )
-                                                })}
+                                            {/* UI Message / Coach Tip */}
+                                            <div className="p-3 bg-slate-900/80 rounded-xl border border-slate-800 flex items-start gap-3">
+                                                <div className="mt-1 text-cyan-400 text-xs">💡</div>
+                                                <p className="text-[11px] text-slate-300 leading-relaxed italic">
+                                                    "{exerciseState.safetyLog.ui_message}"
+                                                </p>
                                             </div>
 
-                                            {/* AI Confidence */}
-                                            <div className="flex items-center justify-between text-[10px] text-slate-600 border-t border-slate-800 pt-2 font-mono">
-                                                <span>AI_CONFIDENCE</span>
-                                                <span>{(exerciseState.painAnalysis.confidence_score * 100).toFixed(1)}%</span>
+                                            {/* System Command */}
+                                            <div className="flex justify-between items-center text-[9px] pt-1">
+                                                <span className="text-slate-600 uppercase">System Command:</span>
+                                                <span className={`px-1.5 py-0.5 rounded font-bold ${exerciseState.safetyLog.system_command ? 'bg-red-900/50 text-red-400 border border-red-800' : 'bg-slate-900 text-slate-600'
+                                                    }`}>
+                                                    {exerciseState.safetyLog.system_command || 'NULL'}
+                                                </span>
                                             </div>
                                         </div>
                                     </div>
                                 </div>
                             )}
 
-                            {/* Clinical Alert Overlay */}
-                            {exerciseState.painAnalysis.recommended_action === 'STOP_EXERCISE' && isActive && (
+                            {/* Safety Alert Overlay */}
+                            {exerciseState.safetyLog.system_command === 'HALT_WORKOUT' && isActive && (
                                 <div className="absolute inset-0 z-40 bg-red-950/40 backdrop-blur-md flex items-center justify-center p-6 text-center animate-pulse">
                                     <div className="max-w-md bg-slate-900 border-4 border-red-600 rounded-3xl p-8 shadow-[0_0_50px_rgba(220,38,38,0.5)]">
-                                        <div className="text-6xl mb-4">⚠️</div>
+                                        <div className="text-6xl mb-4">🆘</div>
                                         <h2 className="text-3xl font-bold text-white mb-2 uppercase tracking-tighter">Safety Halt</h2>
-                                        <p className="text-red-400 font-bold mb-4">Acute Pain Patterns Detected (Confidence: {(exerciseState.painAnalysis.confidence_score * 100).toFixed(0)}%)</p>
-                                        <div className="flex flex-wrap gap-2 justify-center mb-6">
-                                            {exerciseState.painAnalysis.primary_action_units.map(au => (
-                                                <span key={au} className="px-2 py-1 bg-red-900/50 text-red-200 border border-red-700 rounded text-[10px]">{au}</span>
-                                            ))}
+                                        <p className="text-red-400 font-bold mb-4">Sharp Pain Threshold Exceeded</p>
+                                        <p className="text-slate-300 text-sm mb-6 uppercase font-bold tracking-widest text-[10px]">Auto-Lock Executed by RCAFT Engine</p>
+                                        <div className="p-4 bg-red-900/20 border border-red-700/30 rounded-2xl mb-6">
+                                            <p className="text-white text-lg font-bold">"{exerciseState.safetyLog.ui_message}"</p>
                                         </div>
-                                        <p className="text-slate-300 text-sm">Exercise has been automatically paused for your safety.</p>
+                                        <p className="text-slate-400 text-xs text-center">This session has been paused for your safety. Please consult a professional before continuing if pain persists.</p>
                                     </div>
                                 </div>
                             )}

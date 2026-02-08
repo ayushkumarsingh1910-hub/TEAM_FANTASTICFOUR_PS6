@@ -1,20 +1,24 @@
 // Exercise engine for rep counting, phase detection, and form validation
 import {
-    ExerciseState,
+    ExerciseDefinition,
     ExercisePhase,
+    ExerciseState,
+    JointStress,
     Landmark3D,
     PoseLandmark,
-    JointStress,
-    ExerciseDefinition
+    SafetyLog
 } from '@/types';
 import {
-    getElbowAngle,
-    getKneeAngle,
-    getShoulderAngle,
+    CalibrationBaseline,
     calculateAngle3D,
     calculateBiometrics,
+    calculateDistance3D,
+    calculateFormScore,
     evaluateForm,
-    calculateFormScore
+    getElbowAngle,
+    getRobustElbowAngle,
+    getKneeAngle,
+    getShoulderAngle
 } from './Biometrics';
 import { getExerciseById } from '@/data/exercises';
 
@@ -34,6 +38,25 @@ export class ExerciseEngine {
     private lastHoldTick: number = 0;
     private acutePainStartTime: number | null = null;
     private stopCallbacks: (() => void)[] = [];
+
+    // RCAFT Calibration
+    private calibrationFrames: Landmark3D[][] = [];
+    private calibrationStartTime: number | null = null;
+    private baseline: CalibrationBaseline | null = null;
+
+    // Movement Smoothing & Robustness
+    private smaAngleHistory: number[] = [];
+    private painEMA: number = 0;
+    private lastRepTimestamp: number = 0;
+    private readonly REP_COOLDOWN_MS = 850; // Increased for better separation
+    private readonly SMA_WINDOW = 7; // Increased smoothing
+    private readonly EMA_ALPHA = 0.3;
+
+    // State Persistence
+    private lastAttemptedPhase: string = 'IDLE';
+    private phaseFrameCount: number = 0;
+    private readonly MIN_PHASE_FRAMES = 4; // Increased for damping
+    private lastValidAngleTimestamp: number = 0;
 
     constructor(exerciseId: string) {
         this.exerciseId = exerciseId;
@@ -58,7 +81,15 @@ export class ExerciseEngine {
                 intensity_level: 'Low',
                 recommended_action: 'Continue',
                 pain_score_raw: 0
-            }
+            },
+            safetyLog: {
+                status: 'Scanning',
+                pain_level: 0,
+                ui_message: 'Starting calibration...',
+                system_command: null
+            },
+            isCalibrating: true,
+            calibrationProgress: 0
         };
     }
 
@@ -70,17 +101,34 @@ export class ExerciseEngine {
             return this.state;
         }
 
-        const deltaTime = this.previousTimestamp ? timestamp - this.previousTimestamp : 16;
+        const deltaTimeMs = this.previousTimestamp ? timestamp - this.previousTimestamp : 16;
 
-        // Calculate biometrics
+        // RCAFT: Calibration Phase handling
+        if (this.state.isCalibrating) {
+            this.handleCalibration(landmarks, timestamp);
+            return this.state;
+        }
+
+        // Calculate biometrics with baseline normalization
         const biometrics = calculateBiometrics(
             landmarks,
             this.previousLandmarks || undefined,
-            deltaTime
+            deltaTimeMs,
+            this.baseline || undefined
         );
 
         // Get primary angle for this exercise
-        const primaryAngle = this.getPrimaryAngle(landmarks);
+        let primaryAngle = this.getPrimaryAngle(landmarks);
+
+        // Latching Logic: If visibility is lost briefly (< 300ms), reuse last valid angle
+        if (primaryAngle === -1) {
+            if (timestamp - this.lastValidAngleTimestamp < 300 && this.state.currentAngle !== 0) {
+                primaryAngle = this.state.currentAngle;
+            }
+        } else {
+            this.lastValidAngleTimestamp = timestamp;
+        }
+
         this.state.currentAngle = primaryAngle;
 
         // Track angle history for velocity calculation
@@ -93,10 +141,26 @@ export class ExerciseEngine {
         if (this.angleHistory.length >= 2) {
             const velocities = [];
             for (let i = 1; i < this.angleHistory.length; i++) {
-                velocities.push(Math.abs(this.angleHistory[i] - this.angleHistory[i - 1]) / (deltaTime / 1000));
+                if (this.angleHistory[i] !== -1 && this.angleHistory[i - 1] !== -1) {
+                    velocities.push(Math.abs(this.angleHistory[i] - this.angleHistory[i - 1]) / (deltaTimeMs / 1000));
+                }
             }
-            this.state.angularVelocity = velocities.reduce((a, b) => a + b, 0) / velocities.length;
+            this.state.angularVelocity = velocities.length > 0
+                ? velocities.reduce((a, b) => a + b, 0) / velocities.length
+                : 0;
         }
+
+        // Apply SMA Smoothing to Current Angle
+        if (primaryAngle !== -1) {
+            this.smaAngleHistory.push(primaryAngle);
+            if (this.smaAngleHistory.length > this.SMA_WINDOW) this.smaAngleHistory.shift();
+        }
+
+        const smoothedAngle = this.smaAngleHistory.length > 0
+            ? this.smaAngleHistory.reduce((a, b) => a + b, 0) / this.smaAngleHistory.length
+            : -1;
+
+        this.state.currentAngle = smoothedAngle;
 
         // Update symmetry score
         this.state.symmetryScore = biometrics.overallSymmetry;
@@ -106,15 +170,31 @@ export class ExerciseEngine {
         this.state.jointStress = jointStresses;
         this.state.formScore = calculateFormScore(biometrics, jointStresses);
 
-        // Update pain score and analysis
-        this.state.painScore = biometrics.painScore;
-        this.state.painAnalysis = biometrics.painAnalysis;
+        // Update pain score and analysis with EMA Smoothing
+        const rawPainScore = biometrics.painScore;
+        this.painEMA = (this.EMA_ALPHA * rawPainScore) + ((1 - this.EMA_ALPHA) * this.painEMA);
+
+        this.state.painScore = Math.round(this.painEMA);
+        this.state.painAnalysis = {
+            ...biometrics.painAnalysis,
+            pain_score_raw: this.painEMA / 10 // Sync with EMA
+        };
+        this.state.safetyLog = {
+            ...biometrics.safetyLog,
+            pain_level: Math.round(this.painEMA)
+        };
 
         // Clinical Temporal Differentiation: Effort vs Acute Pain
         this.handleClinicalPainThresholds(biometrics.painAnalysis, timestamp);
 
-        // Detect phase transitions
-        this.detectPhaseTransition(primaryAngle);
+        // Detect phase transitions - IGNORE INVALID ANGLES & TRACKING GLITCHES
+        // Velocity guard: Extreme velocity spikes are almost always tracking errors
+        const isGlitching = this.state.angularVelocity > 1000;
+        const cooldownActive = timestamp - this.lastRepTimestamp < this.REP_COOLDOWN_MS;
+
+        if (smoothedAngle !== -1 && smoothedAngle !== 0 && !isGlitching && !cooldownActive) {
+            this.detectPhaseTransition(smoothedAngle, timestamp);
+        }
 
         // Notify form callbacks
         this.formCallbacks.forEach(cb => cb(this.state.formScore, jointStresses));
@@ -133,17 +213,10 @@ export class ExerciseEngine {
         switch (this.exerciseId) {
             case 'pushup':
             case 'tricep-dip':
-                return (getElbowAngle(landmarks, 'left') + getElbowAngle(landmarks, 'right')) / 2;
+                return getRobustElbowAngle(landmarks);
 
             case 'squat':
             case 'lunge':
-                const robustAngle = (landmarks: Landmark3D[]) => {
-                    const leftVis = landmarks[6].visibility || 0; // KNEE indices are 25, 26 but let's be careful
-                    // Actually, let's just use the function from Biometrics.
-                    return 0; // Placeholder for now, will fix below.
-                };
-                // Wait, I should import it or use it. It's already imported in ExerciseEngine via Biometrics? 
-                // No, I need to export it or just use the logic.
                 const leftKnee = (landmarks[PoseLandmark.LEFT_KNEE].visibility || 0) > 0.5 ? getKneeAngle(landmarks, 'left') : -1;
                 const rightKnee = (landmarks[PoseLandmark.RIGHT_KNEE].visibility || 0) > 0.5 ? getKneeAngle(landmarks, 'right') : -1;
 
@@ -153,7 +226,7 @@ export class ExerciseEngine {
                 return (getKneeAngle(landmarks, 'left') + getKneeAngle(landmarks, 'right')) / 2;
 
             case 'bicep-curl':
-                return (getElbowAngle(landmarks, 'left') + getElbowAngle(landmarks, 'right')) / 2;
+                return getRobustElbowAngle(landmarks);
 
             case 'shoulder-press':
             case 'lateral-raise':
@@ -174,9 +247,22 @@ export class ExerciseEngine {
     }
 
     /**
-     * Detect phase transitions and count reps
+     * Detect phase transitions and count reps with Frame Persistence logic
      */
-    private detectPhaseTransition(currentAngle: number): void {
+    private updatePhase(newPhase: string): void {
+        if (newPhase === this.lastAttemptedPhase) {
+            this.phaseFrameCount++;
+        } else {
+            this.lastAttemptedPhase = newPhase;
+            this.phaseFrameCount = 1;
+        }
+
+        if (this.phaseFrameCount >= this.MIN_PHASE_FRAMES) {
+            this.state.phase = newPhase as ExercisePhase;
+        }
+    }
+
+    private detectPhaseTransition(currentAngle: number, timestamp: number): void {
         if (!this.exercise) return;
 
         const { downAngleThreshold, upAngleThreshold } = this.exercise;
@@ -185,45 +271,45 @@ export class ExerciseEngine {
         switch (this.exerciseId) {
             case 'pushup':
             case 'tricep-dip':
-                // Elbow angle: starts high (extended), goes low (bent), back to high
-                // Tightened buffers (10 deg instead of 20) to prevent jitter counting
                 if (this.state.phase === 'IDLE' || this.state.phase === 'UP' || this.state.phase === 'COMPLETE') {
                     if (currentAngle < downAngleThreshold + 10) {
-                        this.state.phase = 'DOWN';
+                        this.updatePhase('DOWN');
                     }
                 } else if (this.state.phase === 'DOWN') {
                     if (currentAngle > upAngleThreshold - 10) {
-                        this.state.phase = 'UP';
                         this.countRep();
+                        this.lastRepTimestamp = timestamp;
+                        this.updatePhase('UP');
                     }
                 }
                 break;
 
             case 'squat':
             case 'lunge':
-                // Knee angle: starts high (standing), goes low (squatting), back to high
                 if (this.state.phase === 'IDLE' || this.state.phase === 'UP' || this.state.phase === 'COMPLETE') {
-                    if (currentAngle < downAngleThreshold + 20) {
-                        this.state.phase = 'DOWN';
+                    if (currentAngle < downAngleThreshold + 10) {
+                        this.updatePhase('DOWN');
                     }
                 } else if (this.state.phase === 'DOWN') {
-                    if (currentAngle > upAngleThreshold - 20) {
-                        this.state.phase = 'UP';
+                    if (currentAngle > upAngleThreshold - 10) {
                         this.countRep();
+                        this.updatePhase('UP');
                     }
                 }
                 break;
 
             case 'bicep-curl':
-                // Elbow angle: starts high (extended), goes low (curled), back to high
-                if (this.state.phase === 'IDLE' || this.state.phase === 'UP' || this.state.phase === 'COMPLETE') {
-                    if (currentAngle < upAngleThreshold + 20) {
-                        this.state.phase = 'DOWN';
+                if (this.state.phase === 'IDLE' || this.state.phase === 'DOWN' || this.state.phase === 'COMPLETE') {
+                    // Start: Need to reach near-full contraction
+                    if (currentAngle < upAngleThreshold + 10) {
+                        this.updatePhase('UP');
                     }
-                } else if (this.state.phase === 'DOWN') {
-                    if (currentAngle > downAngleThreshold - 20) {
-                        this.state.phase = 'UP';
+                } else if (this.state.phase === 'UP') {
+                    // End: Need to reach near-full extension
+                    if (currentAngle > downAngleThreshold - 10) {
                         this.countRep();
+                        this.lastRepTimestamp = timestamp;
+                        this.updatePhase('DOWN');
                     }
                 }
                 break;
@@ -232,58 +318,75 @@ export class ExerciseEngine {
             case 'lateral-raise':
                 if (this.state.phase === 'IDLE' || this.state.phase === 'DOWN' || this.state.phase === 'COMPLETE') {
                     if (currentAngle > upAngleThreshold - 10) {
-                        this.state.phase = 'UP';
+                        this.updatePhase('UP');
                     }
                 } else if (this.state.phase === 'UP') {
                     if (currentAngle < downAngleThreshold + 10) {
-                        this.state.phase = 'DOWN';
                         this.countRep();
+                        this.lastRepTimestamp = timestamp;
+                        this.updatePhase('DOWN');
                     }
                 }
                 break;
 
             case 'jumping-jack':
-                // Based on arm spread
                 if (this.state.phase === 'IDLE' || this.state.phase === 'DOWN' || this.state.phase === 'COMPLETE') {
-                    if (currentAngle > upAngleThreshold) {
-                        this.state.phase = 'UP';
+                    if (currentAngle > upAngleThreshold - 10) {
+                        this.updatePhase('UP');
                     }
                 } else if (this.state.phase === 'UP') {
                     if (currentAngle < downAngleThreshold + 10) {
-                        this.state.phase = 'DOWN';
                         this.countRep();
+                        this.lastRepTimestamp = timestamp;
+                        this.updatePhase('DOWN');
                     }
                 }
                 break;
 
             case 'plank':
-                // Time-based tracking for plank
                 const isGoodForm = this.state.formScore > 70;
                 const isAligned = Math.abs(currentAngle - 180) < 30;
 
                 if (isGoodForm && isAligned) {
                     const now = Date.now();
-                    if (!this.state.isHolding) {
-                        this.state.isHolding = true;
-                        this.state.phase = 'HOLD';
-                        this.lastHoldTick = now;
-                    } else {
-                        // Accumulate time
-                        const delta = now - this.lastHoldTick;
-                        if (delta > 0) {
-                            this.cumulativeHoldDuration += delta;
-                            const newCount = Math.floor(this.cumulativeHoldDuration / 1000);
 
-                            if (newCount > this.state.repCount) {
-                                this.state.repCount = newCount;
-                                this.state.lastRepTime = now;
-                                this.repCallbacks.forEach(cb => cb(this.state.repCount));
+                    // Use persistence for plank holding
+                    if (this.lastAttemptedPhase !== 'HOLD') {
+                        this.lastAttemptedPhase = 'HOLD';
+                        this.phaseFrameCount = 1;
+                    } else {
+                        this.phaseFrameCount++;
+                    }
+
+                    if (this.phaseFrameCount >= this.MIN_PHASE_FRAMES) {
+                        if (!this.state.isHolding) {
+                            this.state.isHolding = true;
+                            this.state.phase = 'HOLD';
+                            this.lastHoldTick = now;
+                        } else {
+                            const delta = now - this.lastHoldTick;
+                            if (delta > 0) {
+                                this.cumulativeHoldDuration += delta;
+                                const newCount = Math.floor(this.cumulativeHoldDuration / 1000);
+
+                                if (newCount > this.state.repCount) {
+                                    this.state.repCount = newCount;
+                                    this.state.lastRepTime = now;
+                                    this.repCallbacks.forEach(cb => cb(this.state.repCount));
+                                }
                             }
+                            this.lastHoldTick = now;
                         }
-                        this.lastHoldTick = now;
                     }
                 } else {
-                    if (this.state.isHolding) {
+                    if (this.lastAttemptedPhase !== 'IDLE') {
+                        this.lastAttemptedPhase = 'IDLE';
+                        this.phaseFrameCount = 1;
+                    } else {
+                        this.phaseFrameCount++;
+                    }
+
+                    if (this.phaseFrameCount >= this.MIN_PHASE_FRAMES && this.state.isHolding) {
                         this.state.isHolding = false;
                         this.state.phase = 'IDLE';
                     }
@@ -291,64 +394,49 @@ export class ExerciseEngine {
                 break;
 
             default:
-                // Generic up/down detection
                 if (this.state.phase === 'IDLE' || this.state.phase === 'UP' || this.state.phase === 'COMPLETE') {
-                    if (currentAngle < downAngleThreshold + 20) {
-                        this.state.phase = 'DOWN';
+                    if (currentAngle < downAngleThreshold + 10) {
+                        this.updatePhase('DOWN');
                     }
                 } else if (this.state.phase === 'DOWN') {
-                    if (currentAngle > upAngleThreshold - 20) {
-                        this.state.phase = 'UP';
+                    if (currentAngle > upAngleThreshold - 10) {
                         this.countRep();
+                        this.lastRepTimestamp = timestamp;
+                        this.updatePhase('UP');
                     }
                 }
+                break;
         }
     }
 
-    /**
-     * Count a rep and notify callbacks
-     */
     private countRep(): void {
         this.state.repCount++;
         this.state.lastRepTime = Date.now();
         this.state.phase = 'COMPLETE';
-
-        // Notify callbacks
         this.repCallbacks.forEach(cb => cb(this.state.repCount));
+
+        // Clear phase history to force a clean reset for the next rep
+        this.lastAttemptedPhase = 'COMPLETE';
+        this.phaseFrameCount = 0;
     }
 
-    /**
-     * Calculate jumping jack angle (arm spread)
-     */
     private getJumpingJackAngle(landmarks: Landmark3D[]): number {
         const leftWrist = landmarks[PoseLandmark.LEFT_WRIST];
         const rightWrist = landmarks[PoseLandmark.RIGHT_WRIST];
         const leftShoulder = landmarks[PoseLandmark.LEFT_SHOULDER];
         const rightShoulder = landmarks[PoseLandmark.RIGHT_SHOULDER];
 
-        // Calculate arm spread as angle from vertical
-        const leftArmAngle = Math.atan2(
-            leftWrist.x - leftShoulder.x,
-            leftShoulder.y - leftWrist.y
-        ) * 180 / Math.PI;
-
-        const rightArmAngle = Math.atan2(
-            rightShoulder.x - rightWrist.x,
-            rightShoulder.y - rightWrist.y
-        ) * 180 / Math.PI;
+        const leftArmAngle = Math.atan2(leftWrist.x - leftShoulder.x, leftShoulder.y - leftWrist.y) * 180 / Math.PI;
+        const rightArmAngle = Math.atan2(rightShoulder.x - rightWrist.x, rightShoulder.y - rightWrist.y) * 180 / Math.PI;
 
         return (Math.abs(leftArmAngle) + Math.abs(rightArmAngle)) / 2;
     }
 
-    /**
-     * Calculate ankle angle for calf raises
-     */
     private getAnkleAngle(landmarks: Landmark3D[]): number {
         const leftKnee = landmarks[PoseLandmark.LEFT_KNEE];
         const leftAnkle = landmarks[PoseLandmark.LEFT_ANKLE];
         const leftHeel = landmarks[PoseLandmark.LEFT_HEEL];
 
-        // Calculate angle at ankle
         const dx1 = leftKnee.x - leftAnkle.x;
         const dy1 = leftKnee.y - leftAnkle.y;
         const dx2 = leftHeel.x - leftAnkle.x;
@@ -359,24 +447,18 @@ export class ExerciseEngine {
         const mag2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
 
         if (mag1 === 0 || mag2 === 0) return 90;
-
         const cosAngle = dotProduct / (mag1 * mag2);
         return Math.acos(Math.max(-1, Math.min(1, cosAngle))) * 180 / Math.PI;
     }
 
-    /**
-     * Calculate plank angle (hip alignment)
-     */
     private getPlankAngle(landmarks: Landmark3D[]): number {
         const leftShoulder = landmarks[PoseLandmark.LEFT_SHOULDER];
         const leftHip = landmarks[PoseLandmark.LEFT_HIP];
         const leftAnkle = landmarks[PoseLandmark.LEFT_ANKLE];
-
         const rightShoulder = landmarks[PoseLandmark.RIGHT_SHOULDER];
         const rightHip = landmarks[PoseLandmark.RIGHT_HIP];
         const rightAnkle = landmarks[PoseLandmark.RIGHT_ANKLE];
 
-        // Determine which side is more visible
         const leftScore = (leftShoulder.visibility || 0) + (leftHip.visibility || 0) + (leftAnkle.visibility || 0);
         const rightScore = (rightShoulder.visibility || 0) + (rightHip.visibility || 0) + (rightAnkle.visibility || 0);
 
@@ -384,43 +466,34 @@ export class ExerciseEngine {
             return calculateAngle3D(leftShoulder, leftHip, leftAnkle);
         } else if (rightScore > 1.5) {
             return calculateAngle3D(rightShoulder, rightHip, rightAnkle);
-        } else {
-            // Fallback or average if visibility is low
-            return 180;
         }
+        return 180;
     }
 
-    /**
-     * Subscribe to rep count updates
-     */
     onRep(callback: (count: number) => void): void {
         this.repCallbacks.push(callback);
     }
 
-    /**
-     * Subscribe to form updates
-     */
     onFormUpdate(callback: (score: number, stresses: JointStress[]) => void): void {
         this.formCallbacks.push(callback);
     }
 
-    /**
-     * Get current state
-     */
+    onStopRequest(callback: () => void): void {
+        this.stopCallbacks.push(callback);
+    }
+
     getState(): ExerciseState {
         return { ...this.state };
     }
 
-    /**
-     * Get elapsed time in seconds
-     */
+    getExercise(): ExerciseDefinition | undefined {
+        return this.exercise;
+    }
+
     getElapsedTime(): number {
         return (Date.now() - this.state.startTime) / 1000;
     }
 
-    /**
-     * Reset the engine
-     */
     reset(): void {
         this.state = {
             exerciseId: this.exerciseId,
@@ -441,7 +514,15 @@ export class ExerciseEngine {
                 intensity_level: 'Low',
                 recommended_action: 'Continue',
                 pain_score_raw: 0
-            }
+            },
+            safetyLog: {
+                status: 'Scanning',
+                pain_level: 0,
+                ui_message: 'Starting calibration...',
+                system_command: null
+            },
+            isCalibrating: true,
+            calibrationProgress: 0
         };
         this.previousLandmarks = null;
         this.previousTimestamp = 0;
@@ -449,66 +530,120 @@ export class ExerciseEngine {
         this.cumulativeHoldDuration = 0;
         this.lastHoldTick = 0;
         this.acutePainStartTime = null;
+        this.calibrationFrames = [];
+        this.calibrationStartTime = null;
+        this.baseline = null;
+        this.smaAngleHistory = [];
+        this.painEMA = 0;
+        this.lastRepTimestamp = 0;
     }
 
-    /**
-     * Handle clinical pain thresholds with temporal differentiation
-     */
+    private handleCalibration(landmarks: Landmark3D[], timestamp: number): void {
+        if (!this.calibrationStartTime) {
+            this.calibrationStartTime = timestamp;
+        }
+
+        const elapsed = timestamp - this.calibrationStartTime;
+        this.state.calibrationProgress = Math.min(100, (elapsed / 3000) * 100);
+        this.state.safetyLog.status = 'Calibrating';
+        this.state.safetyLog.ui_message = 'Please maintain a neutral expression...';
+
+        this.calibrationFrames.push(landmarks);
+
+        if (elapsed >= 3000) {
+            this.baseline = this.computeBaseline();
+            this.state.isCalibrating = false;
+            this.state.safetyLog.status = 'Scanning';
+            this.state.safetyLog.ui_message = 'Calibration complete. Starting analysis.';
+        }
+    }
+
+    private computeBaseline(): CalibrationBaseline {
+        let counts = 0;
+        const sums = { eyeDist: 0, eyeNoseRatio: 0, eyeNarrowRatio: 0, mouthNoseRatio: 0, mouthWidthRatio: 0 };
+
+        this.calibrationFrames.forEach(frame => {
+            const nose = frame[PoseLandmark.NOSE];
+            const leftEye = frame[PoseLandmark.LEFT_EYE];
+            const rightEye = frame[PoseLandmark.RIGHT_EYE];
+            const leftEyeInner = frame[PoseLandmark.LEFT_EYE_INNER];
+            const rightEyeInner = frame[PoseLandmark.RIGHT_EYE_INNER];
+            const leftEyeOuter = frame[PoseLandmark.LEFT_EYE_OUTER];
+            const rightEyeOuter = frame[PoseLandmark.RIGHT_EYE_OUTER];
+            const mouthLeft = frame[PoseLandmark.MOUTH_LEFT];
+            const mouthRight = frame[PoseLandmark.MOUTH_RIGHT];
+
+            if (nose && leftEye && rightEye && leftEyeInner && rightEyeInner && mouthLeft && mouthRight) {
+                const eyeDist = calculateDistance3D(leftEye, rightEye);
+                if (eyeDist === 0) return;
+
+                sums.eyeDist += eyeDist;
+                sums.eyeNoseRatio += ((calculateDistance3D(leftEyeInner, nose) + calculateDistance3D(rightEyeInner, nose)) / 2) / eyeDist;
+                sums.eyeNarrowRatio += ((Math.abs(leftEyeInner.x - leftEyeOuter.x) + Math.abs(rightEyeInner.x - rightEyeOuter.x)) / 2) / eyeDist;
+                sums.mouthNoseRatio += ((calculateDistance3D(mouthLeft, nose) + calculateDistance3D(mouthRight, nose)) / 2) / eyeDist;
+                sums.mouthWidthRatio += calculateDistance3D(mouthLeft, mouthRight) / eyeDist;
+                counts++;
+            }
+        });
+
+        if (counts === 0) {
+            return { eyeDist: 0.1, eyeNoseRatio: 0.6, eyeNarrowRatio: 0.25, mouthNoseRatio: 0.9, mouthWidthRatio: 0.9 };
+        }
+
+        return {
+            eyeDist: sums.eyeDist / counts,
+            eyeNoseRatio: sums.eyeNoseRatio / counts,
+            eyeNarrowRatio: sums.eyeNarrowRatio / counts,
+            mouthNoseRatio: sums.mouthNoseRatio / counts,
+            mouthWidthRatio: sums.mouthWidthRatio / counts,
+        };
+    }
+
     private handleClinicalPainThresholds(analysis: any, timestamp: number): void {
         const painScoreRaw = analysis.pain_score_raw;
         const isPeak = this.isPeakOfContraction();
 
-        if (painScoreRaw > 7) {
-            // Rule: Distinguish peak-effort grimace from acute pain
-            if (isPeak && analysis.intensity_level !== 'Critical' && this.state.phase === 'UP') {
-                // Rhythmic effort grimace - non-critical
+        this.state.safetyLog.pain_level = Math.round(painScoreRaw * 10);
+
+        if (painScoreRaw > 8.5) {
+            if (isPeak && analysis.intensity_level !== 'Critical') {
+                this.state.safetyLog.status = 'Effort Detected';
+                this.state.safetyLog.ui_message = 'High effort detected. Keep breathing.';
                 this.acutePainStartTime = null;
             } else {
-                // Acute / Sudden pain detection
+                this.state.safetyLog.status = 'PAIN ALERT';
+                this.state.safetyLog.ui_message = 'Sudden muscle tension! Ease up.';
+
                 if (this.acutePainStartTime === null) {
                     this.acutePainStartTime = timestamp;
-                } else if (timestamp - this.acutePainStartTime > 1500) {
-                    // Safety threshold exceeded: High pain for > 1.5s
+                } else if (timestamp - this.acutePainStartTime > 2500) {
+                    this.state.safetyLog.ui_message = 'Stop! Drop the weights';
+                    this.state.safetyLog.system_command = 'HALT_WORKOUT';
                     this.state.painAnalysis.recommended_action = 'STOP_EXERCISE';
                     this.stopCallbacks.forEach(cb => cb());
                 }
             }
         } else {
+            this.state.safetyLog.status = 'Scanning';
+            this.state.safetyLog.ui_message = 'Motion within safe comfort zones.';
             this.acutePainStartTime = null;
         }
     }
 
-    /**
-     * Determines if user is at the peak point of exertion/contraction
-     */
     private isPeakOfContraction(): boolean {
         if (!this.exercise) return false;
         const { currentAngle } = this.state;
         const { downAngleThreshold, upAngleThreshold } = this.exercise;
 
+        // Peak exertion is usually at the bottom of a squat/pushup or top of a curl
         switch (this.exerciseId) {
             case 'bicep-curl':
-                return currentAngle < upAngleThreshold + 15; // Peak contraction at top
+                return currentAngle < upAngleThreshold + 15;
             case 'squat':
-                return currentAngle < downAngleThreshold + 15; // Peak effort at bottom
             case 'pushup':
                 return currentAngle < downAngleThreshold + 15;
             default:
                 return false;
         }
-    }
-
-    /**
-     * Subscribe to stop triggers (injury prevention)
-     */
-    onStopRequest(callback: () => void): void {
-        this.stopCallbacks.push(callback);
-    }
-
-    /**
-     * Get the exercise definition
-     */
-    getExercise(): ExerciseDefinition | undefined {
-        return this.exercise;
     }
 }
